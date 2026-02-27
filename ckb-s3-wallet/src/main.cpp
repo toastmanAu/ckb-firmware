@@ -27,6 +27,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include "ckb_config.h"
+#include "gt911.h"
 #include <Arduino_GFX_Library.h>
 
 /* Fonts */
@@ -108,6 +109,7 @@ static ckb_cfg_t   cfg    = {};
  * ═══════════════════════════════════════════════════════════════════ */
 static Arduino_ESP32RGBPanel   *bus = nullptr;
 static Arduino_ST7701_RGBPanel *gfx = nullptr;
+static GT911 touch;
 
 static void init_display() {
     bus = new Arduino_ESP32RGBPanel(
@@ -341,10 +343,15 @@ static void load_key() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * TOUCH (GT911) — placeholder, wire up GT911 I2C driver
+ * TOUCH (GT911 via gt911.h)
+ * SDA=19, SCL=45, INT=40, RST=41 — Guition 4848S040 standard
  * ═══════════════════════════════════════════════════════════════════ */
 static bool touch_get(int *tx, int *ty) {
-    /* TODO: implement GT911 I2C read (addr 0x5D or 0x14, I2C1) */
+    if (touch.read() && touch.pressed) {
+        *tx = touch.x;
+        *ty = touch.y;
+        return true;
+    }
     return false;
 }
 
@@ -405,6 +412,15 @@ void setup() {
 
     load_key();
     connect_wifi();
+
+    /* Touch — scan I2C first to verify pins, then init GT911 */
+    GT911::scanI2C();
+    if (!touch.begin()) {
+        Serial.println("[boot] GT911 init failed — touch disabled");
+    } else {
+        Serial.println("[boot] GT911 touch ready");
+    }
+
     refresh_balance();
 
     current_screen = SCREEN_HOME;
