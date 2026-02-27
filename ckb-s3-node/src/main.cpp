@@ -1,14 +1,20 @@
 /*
- * CKB WiFi Dashboard — Guition ESP32-S3-4848S040
- * ================================================
- * Full node health dashboard via direct CKB RPC over WiFi.
- * Displays: block height, time since last block, peers,
- *           mempool TX count, epoch progress, node status.
+ * CKB S3 Node — Guition ESP32-S3-4848S040
+ * =========================================
+ * Embedded CKB light client node. Tracks live chain state via WiFi RPC
+ * and renders it on the 480×480 display. Also accepts inbound HTTP
+ * requests to broadcast signed transactions to the CKB network.
  *
  * RPCs used:
- *   get_tip_header       — height, timestamp, epoch, difficulty
+ *   get_tip_header       — height, timestamp, epoch
  *   get_peers            — peer count
  *   get_raw_tx_pool      — mempool pending TX count
+ *   send_transaction     — broadcast (inbound from HTTP POST /broadcast)
+ *
+ * HTTP server (port 8080):
+ *   POST /broadcast      — body: signed tx JSON → forwards to CKB node
+ *   GET  /status         — returns current chain state as JSON
+ *   GET  /health         — "OK"
  *
  * Platform: PlatformIO + espressif32@6.5.0 (IDF 4.4.6)
  * Library:  Arduino_GFX 1.2.9 (lib/Arduino_GFX — factory version)
@@ -17,6 +23,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include "ckb_config.h"
 #include <Arduino_GFX_Library.h>
 
@@ -72,6 +79,17 @@
  * ═══════════════════════════════════════════════════════════════════ */
 static Arduino_ESP32RGBPanel   *bus = nullptr;
 static Arduino_ST7701_RGBPanel *gfx = nullptr;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * HTTP BROADCAST SERVER (port 8080)
+ * ═══════════════════════════════════════════════════════════════════
+ * POST /broadcast  — body must be a complete signed tx JSON object
+ *                    (the "transaction" field value from send_transaction)
+ *                    Returns: {"result":"<txhash>"} or {"error":"..."}
+ * GET  /status     — chain state JSON
+ * GET  /health     — "OK"
+ * ═══════════════════════════════════════════════════════════════════ */
+static WebServer http_server(8080);
 
 static void init_display() {
     bus = new Arduino_ESP32RGBPanel(
@@ -477,6 +495,71 @@ static void draw_splash() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * HTTP HANDLERS
+ * ═══════════════════════════════════════════════════════════════════ */
+static void handle_health() {
+    http_server.send(200, "text/plain", "OK");
+}
+
+static void handle_status() {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"height\":%llu,\"peers\":%lu,\"mempool\":%lu,"
+        "\"epoch\":%llu,\"epoch_idx\":%lu,\"epoch_len\":%lu,"
+        "\"ok\":%s,\"polls\":%lu}",
+        (unsigned long long)state.height,
+        (unsigned long)state.peers,
+        (unsigned long)state.mempool_tx,
+        (unsigned long long)state.epoch_num,
+        (unsigned long)state.epoch_idx,
+        (unsigned long)state.epoch_len,
+        state.ok ? "true" : "false",
+        (unsigned long)state.query_count);
+    http_server.send(200, "application/json", buf);
+}
+
+static void handle_broadcast() {
+    if (http_server.method() != HTTP_POST) {
+        http_server.send(405, "text/plain", "POST required");
+        return;
+    }
+    String tx_json = http_server.arg("plain");
+    if (tx_json.isEmpty()) {
+        http_server.send(400, "application/json", "{\"error\":\"empty body\"}");
+        return;
+    }
+
+    /* Wrap in send_transaction RPC envelope */
+    String body = "{\"jsonrpc\":\"2.0\",\"method\":\"send_transaction\","
+                  "\"params\":[" + tx_json + ",\"passthrough\"],\"id\":1}";
+
+    const char *url = (cfg.valid && cfg.node_url[0]) ? cfg.node_url : CKB_RPC;
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    String resp = (code > 0) ? http.getString() : "";
+    http.end();
+
+    if (code <= 0 || resp.isEmpty()) {
+        http_server.send(502, "application/json", "{\"error\":\"RPC unreachable\"}");
+        return;
+    }
+
+    /* Pass the raw RPC response back to the caller */
+    http_server.send(200, "application/json", resp);
+    Serial.println("[broadcast] tx forwarded: " + resp.substring(0, 80));
+}
+
+static void start_http_server() {
+    http_server.on("/health",    HTTP_GET,  handle_health);
+    http_server.on("/status",    HTTP_GET,  handle_status);
+    http_server.on("/broadcast", HTTP_POST, handle_broadcast);
+    http_server.begin();
+    Serial.println("[HTTP] server started on :8080");
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * WIFI
  * ═══════════════════════════════════════════════════════════════════ */
 static void connect_wifi() {
@@ -545,10 +628,12 @@ void setup() {
 
     draw_splash();
     connect_wifi();
+    start_http_server();
     delay(200);
 }
 
 void loop() {
+    http_server.handleClient();
     update();
     delay(POLL_MS);
 }
