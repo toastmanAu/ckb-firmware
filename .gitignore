@@ -1,0 +1,6 @@
+.pio/
+compile_commands.json
+*.bin
+*.elf
+*.map
+*.dblite
