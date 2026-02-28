@@ -78,7 +78,17 @@
  * DISPLAY
  * ═══════════════════════════════════════════════════════════════════ */
 static Arduino_ESP32RGBPanel   *bus = nullptr;
+
+#ifdef SCREENSHOT_SERVER
+/* In screenshot builds, gfx is an Arduino_Canvas backed by PSRAM.
+ * All existing gfx-> draw calls work unchanged (same Arduino_GFX API).
+ * screenshot_flush() pushes the canvas to the real panel each frame. */
+#include "screenshot.h"
+static Arduino_Canvas          *gfx = nullptr;   // canvas = "gfx" here
+static Arduino_ST7701_RGBPanel *panel = nullptr;  // real display
+#else
 static Arduino_ST7701_RGBPanel *gfx = nullptr;
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  * HTTP BROADCAST SERVER (port 8080)
@@ -99,10 +109,24 @@ static void init_display() {
         8,20,3,46,9,10,          /* G0-G5 */
         4,5,6,7,15);             /* B0-B4 */
 
+#ifdef SCREENSHOT_SERVER
+    /* Screenshot build: create real panel + a canvas that mirrors all draws.
+     * Canvas is PSRAM-backed (480×480×2 = 460KB). flush() pushes to panel. */
+    panel = new Arduino_ST7701_RGBPanel(
+        bus, GFX_NOT_DEFINED, 0, true, W, H,
+        st7701_type1_init_operations, sizeof(st7701_type1_init_operations), true,
+        10,8,50,  10,8,20);
+    gfx = new Arduino_Canvas(W, H, panel);
+    /* Export for screenshot.cpp */
+    ss_bus    = bus;
+    ss_canvas = gfx;
+    ss_panel  = panel;
+#else
     gfx = new Arduino_ST7701_RGBPanel(
         bus, GFX_NOT_DEFINED, 0, true, W, H,
         st7701_type1_init_operations, sizeof(st7701_type1_init_operations), true,
         10,8,50,  10,8,20);
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -523,21 +547,35 @@ static void handle_broadcast() {
         http_server.send(405, "text/plain", "POST required");
         return;
     }
-    String tx_json = http_server.arg("plain");
-    if (tx_json.isEmpty()) {
+    String body = http_server.arg("plain");
+    if (body.isEmpty()) {
         http_server.send(400, "application/json", "{\"error\":\"empty body\"}");
         return;
     }
 
-    /* Wrap in send_transaction RPC envelope */
-    String body = "{\"jsonrpc\":\"2.0\",\"method\":\"send_transaction\","
-                  "\"params\":[" + tx_json + ",\"passthrough\"],\"id\":1}";
+    /* Accept two formats:
+     *   1. Full JSON-RPC envelope (from CKBClient::broadcast):
+     *      {"jsonrpc":"2.0","method":"send_transaction","params":[tx,...],"id":N}
+     *      → forward as-is
+     *   2. Raw tx object (from custom clients):
+     *      {"version":"0x0","inputs":[...],...}
+     *      → wrap in send_transaction envelope
+     */
+    String rpc_body;
+    if (body.indexOf("\"method\"") >= 0 && body.indexOf("send_transaction") >= 0) {
+        /* Already a full RPC envelope — forward as-is */
+        rpc_body = body;
+    } else {
+        /* Raw tx object — wrap it */
+        rpc_body = "{\"jsonrpc\":\"2.0\",\"method\":\"send_transaction\","
+                   "\"params\":[" + body + ",\"passthrough\"],\"id\":1}";
+    }
 
     const char *url = (cfg.valid && cfg.node_url[0]) ? cfg.node_url : CKB_RPC;
     HTTPClient http;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    int code = http.POST(body);
+    int code = http.POST(rpc_body);
     String resp = (code > 0) ? http.getString() : "";
     http.end();
 
@@ -546,15 +584,17 @@ static void handle_broadcast() {
         return;
     }
 
-    /* Pass the raw RPC response back to the caller */
     http_server.send(200, "application/json", resp);
-    Serial.println("[broadcast] tx forwarded: " + resp.substring(0, 80));
+    Serial.println("[broadcast] forwarded → " + resp.substring(0, 80));
 }
 
 static void start_http_server() {
     http_server.on("/health",    HTTP_GET,  handle_health);
     http_server.on("/status",    HTTP_GET,  handle_status);
     http_server.on("/broadcast", HTTP_POST, handle_broadcast);
+    #ifdef SCREENSHOT_SERVER
+    screenshot_init(http_server);
+    #endif
     http_server.begin();
     Serial.println("[HTTP] server started on :8080");
 }
@@ -635,5 +675,8 @@ void setup() {
 void loop() {
     http_server.handleClient();
     update();
+    #ifdef SCREENSHOT_SERVER
+    screenshot_flush();   /* push canvas → RGB panel after each full redraw */
+    #endif
     delay(POLL_MS);
 }
